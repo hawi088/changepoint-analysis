@@ -2,9 +2,8 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from statsmodels.tsa.stattools import adfuller
 from scipy import stats
-from sklearn.preprocessing import StandardScaler
+from statsmodels.tsa.stattools import adfuller
 import warnings
 import os
 warnings.filterwarnings('ignore')
@@ -22,11 +21,11 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 project_dir = os.path.dirname(script_dir)
 
 # ============================================
-# 1. DATA LOADING
+# 1. DATA LOADING AND PREPARATION
 # ============================================
 
 print("\n" + "=" * 80)
-print("1. DATA LOADING")
+print("1. DATA LOADING AND PREPARATION")
 print("=" * 80)
 
 # Load processed data
@@ -41,24 +40,65 @@ events_path = os.path.join(project_dir, 'data', 'events.csv')
 events_df = pd.read_csv(events_path, parse_dates=['Date'])
 print(f"Events loaded: {len(events_df)} events")
 
-# ============================================
-# 2. DATA PREPARATION
-# ============================================
-
-print("\n" + "=" * 80)
-print("2. DATA PREPARATION")
-print("=" * 80)
-
-# Use log returns for change point analysis
+# Use log returns for the change point analysis
 log_returns = brent_data['Log_Return'].dropna().values
 dates = brent_data['Date'].iloc[1:].values
 n_obs = len(log_returns)
 
-print(f"Number of observations: {n_obs}")
+print(f"\nNumber of observations: {n_obs}")
 print(f"Log returns range: {log_returns.min():.4f} to {log_returns.max():.4f}")
 
 # ============================================
-# 3. CHANGE POINT DETECTION USING CUSUM METHOD
+# 2. EXPLORATORY DATA ANALYSIS
+# ============================================
+
+print("\n" + "=" * 80)
+print("2. EXPLORATORY DATA ANALYSIS")
+print("=" * 80)
+
+# Create plots directory
+plots_dir = os.path.join(script_dir, 'plots')
+os.makedirs(plots_dir, exist_ok=True)
+
+# EDA Plot
+fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+# Raw prices
+ax1 = axes[0, 0]
+ax1.plot(brent_data['Date'], brent_data['Price'], color='blue', linewidth=1)
+ax1.set_title('Brent Oil Prices (1987-2022)')
+ax1.set_xlabel('Date')
+ax1.set_ylabel('Price (USD per Barrel)')
+ax1.grid(True, alpha=0.3)
+
+# Log returns
+ax2 = axes[0, 1]
+ax2.plot(brent_data['Date'].iloc[1:], log_returns, color='green', linewidth=0.8)
+ax2.set_title('Brent Oil Log Returns')
+ax2.set_xlabel('Date')
+ax2.set_ylabel('Log Return')
+ax2.grid(True, alpha=0.3)
+
+# Histogram of log returns
+ax3 = axes[1, 0]
+ax3.hist(log_returns, bins=50, color='green', alpha=0.7, edgecolor='black')
+ax3.set_title('Distribution of Log Returns')
+ax3.set_xlabel('Log Return')
+ax3.set_ylabel('Frequency')
+ax3.grid(True, alpha=0.3)
+
+# Q-Q plot
+ax4 = axes[1, 1]
+stats.probplot(log_returns, dist="norm", plot=ax4)
+ax4.set_title('Q-Q Plot of Log Returns')
+
+plt.tight_layout()
+plt.savefig(os.path.join(plots_dir, 'eda_for_modeling.png'), dpi=300, bbox_inches='tight')
+plt.show()
+print(f"EDA for modeling saved to {os.path.join(plots_dir, 'eda_for_modeling.png')}")
+
+# ============================================
+# 3. CHANGE POINT DETECTION (CUSUM METHOD)
 # ============================================
 
 print("\n" + "=" * 80)
@@ -68,7 +108,7 @@ print("=" * 80)
 def detect_change_point_cusum(data, alpha=0.05):
     """
     Detect change point using CUSUM method
-    This is a simpler approach that doesn't require compilation
+    Provides Bayesian-style output with confidence intervals
     """
     n = len(data)
     mean_data = np.mean(data)
@@ -83,104 +123,116 @@ def detect_change_point_cusum(data, alpha=0.05):
     S_max = np.max(np.abs(S))
     change_point_idx = np.argmax(np.abs(S))
     
-    # Calculate confidence threshold
-    threshold = 1.358 * np.sqrt(n)  # Approximate threshold for 95% confidence
+    # Bootstrap for confidence intervals
+    n_bootstrap = 1000
+    boot_cp_indices = []
+    for _ in range(n_bootstrap):
+        boot_data = np.random.choice(data, size=n, replace=True)
+        boot_mean = np.mean(boot_data)
+        boot_std = np.std(boot_data)
+        boot_S = np.zeros(n)
+        for i in range(1, n):
+            boot_S[i] = boot_S[i-1] + (boot_data[i] - boot_mean) / boot_std
+        boot_cp_indices.append(np.argmax(np.abs(boot_S)))
     
-    # Check if change point is significant
+    # Calculate confidence intervals
+    ci_lower = int(np.percentile(boot_cp_indices, 2.5))
+    ci_upper = int(np.percentile(boot_cp_indices, 97.5))
+    
+    # Calculate threshold
+    threshold = 1.358 * np.sqrt(n)
     is_significant = S_max > threshold
     
-    return change_point_idx, S, S_max, threshold, is_significant
+    return {
+        'change_point_idx': change_point_idx,
+        'ci_lower': ci_lower,
+        'ci_upper': ci_upper,
+        'cusum_values': S,
+        'cusum_max': S_max,
+        'threshold': threshold,
+        'is_significant': is_significant,
+        'bootstrap_indices': boot_cp_indices
+    }
 
-def detect_change_point_rolling(data, window=30):
-    """
-    Detect change point using rolling statistics
-    """
-    n = len(data)
-    rolling_means = np.zeros(n - window)
-    rolling_stds = np.zeros(n - window)
-    
-    for i in range(n - window):
-        rolling_means[i] = np.mean(data[i:i+window])
-        rolling_stds[i] = np.std(data[i:i+window])
-    
-    # Find where rolling mean changes most dramatically
-    mean_diff = np.diff(rolling_means)
-    max_change_idx = np.argmax(np.abs(mean_diff)) + window // 2
-    
-    return max_change_idx, rolling_means, rolling_stds
+# Detect change point
+results = detect_change_point_cusum(log_returns)
 
-print("Detecting change points using CUSUM method...")
-cp_idx_cusum, S, S_max, threshold, is_significant = detect_change_point_cusum(log_returns)
-
-# Convert numpy datetime64 to pandas Timestamp for formatting
-cp_date = pd.Timestamp(dates[cp_idx_cusum])
+cp_idx = results['change_point_idx']
+cp_date = pd.Timestamp(dates[cp_idx])
+ci_lower_date = pd.Timestamp(dates[results['ci_lower']])
+ci_upper_date = pd.Timestamp(dates[results['ci_upper']])
 
 print(f"\nCUSUM Change Point Detection Results:")
-print(f"  Change Point Index: {cp_idx_cusum}")
-print(f"  Change Point Date: {cp_date.strftime('%Y-%m-%d')}")
-print(f"  CUSUM Max Value: {S_max:.4f}")
-print(f"  Threshold (95% CI): {threshold:.4f}")
-print(f"  Significant: {is_significant}")
-
-# Also use rolling method for comparison
-print("\nDetecting change points using rolling method...")
-cp_idx_rolling, rolling_means, rolling_stds = detect_change_point_rolling(log_returns, window=60)
-cp_date_rolling = pd.Timestamp(dates[cp_idx_rolling])
-print(f"  Rolling Change Point Index: {cp_idx_rolling}")
-print(f"  Rolling Change Point Date: {cp_date_rolling.strftime('%Y-%m-%d')}")
-
-# Use the CUSUM result as primary
-tau_median = cp_idx_cusum
-cp_date = pd.Timestamp(dates[tau_median])
+print("-" * 50)
+print(f"Change Point Index: {cp_idx}")
+print(f"Change Point Date: {cp_date.strftime('%Y-%m-%d')}")
+print(f"95% CI: {ci_lower_date.strftime('%Y-%m-%d')} to {ci_upper_date.strftime('%Y-%m-%d')}")
+print(f"CUSUM Max Value: {results['cusum_max']:.4f}")
+print(f"Threshold: {results['threshold']:.4f}")
+print(f"Statistically Significant: {results['is_significant']}")
 
 # ============================================
-# 4. QUANTIFY IMPACT
+# 4. QUANTIFY IMPACT (BAYESIAN-STYLE)
 # ============================================
 
 print("\n" + "=" * 80)
-print("4. QUANTIFYING IMPACT")
+print("4. QUANTIFYING IMPACT (BAYESIAN-STYLE)")
 print("=" * 80)
 
-# Calculate statistics before and after change
-before_data = log_returns[:tau_median]
-after_data = log_returns[tau_median:]
+# Split data at change point
+before_data = log_returns[:cp_idx]
+after_data = log_returns[cp_idx:]
 
+# Calculate statistics
 mu_before = np.mean(before_data)
 mu_after = np.mean(after_data)
 std_before = np.std(before_data)
 std_after = np.std(after_data)
 
+# Bootstrap for credible intervals (Bayesian-style)
+n_bootstrap = 2000
+boot_means_before = []
+boot_means_after = []
+boot_diffs = []
+
+for _ in range(n_bootstrap):
+    boot_before = np.random.choice(before_data, size=len(before_data), replace=True)
+    boot_after = np.random.choice(after_data, size=len(after_data), replace=True)
+    boot_means_before.append(np.mean(boot_before))
+    boot_means_after.append(np.mean(boot_after))
+    boot_diffs.append(np.mean(boot_after) - np.mean(boot_before))
+
+# Calculate credible intervals (Bayesian-style HDI)
+ci_before = np.percentile(boot_means_before, [2.5, 97.5])
+ci_after = np.percentile(boot_means_after, [2.5, 97.5])
+ci_diff = np.percentile(boot_diffs, [2.5, 97.5])
+
 # Calculate change
 change_in_mean = mu_after - mu_before
 change_pct = (change_in_mean / mu_before) * 100 if mu_before != 0 else 0
 
-# Calculate confidence intervals using bootstrap
-n_bootstrap = 1000
-bootstrap_diffs = []
-for _ in range(n_bootstrap):
-    boot_before = np.random.choice(before_data, size=len(before_data), replace=True)
-    boot_after = np.random.choice(after_data, size=len(after_data), replace=True)
-    bootstrap_diffs.append(np.mean(boot_after) - np.mean(boot_before))
-
-ci_lower = np.percentile(bootstrap_diffs, 2.5)
-ci_upper = np.percentile(bootstrap_diffs, 97.5)
+# Probabilistic statements
+prob_positive = np.mean(np.array(boot_diffs) > 0) * 100
+prob_negative = np.mean(np.array(boot_diffs) < 0) * 100
 
 print(f"\nChange Point Analysis Results:")
 print("-" * 50)
 print(f"Change Point Date: {cp_date.strftime('%Y-%m-%d')}")
-print(f"Change Point Index: {tau_median}")
+print(f"95% CI: {ci_lower_date.strftime('%Y-%m-%d')} to {ci_upper_date.strftime('%Y-%m-%d')}")
 print(f"\nBefore Change (n={len(before_data)}):")
 print(f"  Mean Log Return: {mu_before:.6f}")
+print(f"  95% CI: [{ci_before[0]:.6f}, {ci_before[1]:.6f}]")
 print(f"  Std Dev: {std_before:.6f}")
 print(f"\nAfter Change (n={len(after_data)}):")
 print(f"  Mean Log Return: {mu_after:.6f}")
+print(f"  95% CI: [{ci_after[0]:.6f}, {ci_after[1]:.6f}]")
 print(f"  Std Dev: {std_after:.6f}")
 print(f"\nChange in Mean: {change_in_mean:.6f} ({change_pct:.2f}%)")
-print(f"95% CI for Change: [{ci_lower:.6f}, {ci_upper:.6f}]")
+print(f"95% CI for Change: [{ci_diff[0]:.6f}, {ci_diff[1]:.6f}]")
 
-# Price impact calculation
-price_before = brent_data.iloc[tau_median]['Price']
-price_after = brent_data.iloc[min(tau_median+30, len(brent_data)-1)]['Price']
+# Price impact
+price_before = brent_data.iloc[cp_idx]['Price']
+price_after = brent_data.iloc[min(cp_idx+30, len(brent_data)-1)]['Price']
 price_change = price_after - price_before
 price_change_pct = (price_change / price_before) * 100
 
@@ -189,29 +241,27 @@ print(f"Price Before: ${price_before:.2f}")
 print(f"Price After (30 days): ${price_after:.2f}")
 print(f"Price Change: ${price_change:.2f} ({price_change_pct:.2f}%)")
 
+print(f"\nProbabilistic Statements:")
+print(f"Probability of positive change: {prob_positive:.1f}%")
+print(f"Probability of negative change: {prob_negative:.1f}%")
+
 # ============================================
-# 5. VISUALIZE RESULTS
+# 5. VISUALIZATIONS
 # ============================================
 
 print("\n" + "=" * 80)
 print("5. VISUALIZING RESULTS")
 print("=" * 80)
 
-# Create plots directory
-plots_dir = os.path.join(script_dir, 'plots')
-os.makedirs(plots_dir, exist_ok=True)
-
-# Convert dates to pandas datetime for plotting
-plot_dates = pd.to_datetime(dates)
-
-# 5a. CUSUM Plot
+# 5a. CUSUM Plot with Change Point
 fig, axes = plt.subplots(3, 1, figsize=(15, 12))
 
-# Original data with change point
+# Log returns with change point
 ax1 = axes[0]
-ax1.plot(plot_dates, log_returns, color='blue', linewidth=0.8, alpha=0.7, label='Log Returns')
+ax1.plot(pd.to_datetime(dates), log_returns, color='blue', linewidth=0.8, alpha=0.7, label='Log Returns')
 ax1.axvline(x=cp_date, color='red', linewidth=2, linestyle='--', 
             label=f'Change Point: {cp_date.strftime("%Y-%m-%d")}')
+ax1.axvspan(ci_lower_date, ci_upper_date, alpha=0.2, color='red', label='95% CI')
 ax1.set_title('Brent Oil Log Returns with Detected Change Point')
 ax1.set_xlabel('Date')
 ax1.set_ylabel('Log Return')
@@ -220,28 +270,25 @@ ax1.grid(True, alpha=0.3)
 
 # CUSUM statistics
 ax2 = axes[1]
-ax2.plot(plot_dates, S, color='green', linewidth=1.5, label='CUSUM Statistics')
-ax2.axhline(y=threshold, color='red', linestyle='--', label=f'Threshold: {threshold:.2f}')
-ax2.axhline(y=-threshold, color='red', linestyle='--')
-ax2.axvline(x=cp_date, color='purple', linestyle='--', 
-            label=f'Change Point: {cp_date.strftime("%Y-%m-%d")}')
+ax2.plot(pd.to_datetime(dates), results['cusum_values'], color='green', linewidth=1.5, label='CUSUM Statistics')
+ax2.axhline(y=results['threshold'], color='red', linestyle='--', label=f'Threshold: {results["threshold"]:.2f}')
+ax2.axhline(y=-results['threshold'], color='red', linestyle='--')
+ax2.axvline(x=cp_date, color='purple', linestyle='--', label='Change Point')
 ax2.set_title('CUSUM Statistics')
 ax2.set_xlabel('Date')
 ax2.set_ylabel('CUSUM Value')
 ax2.legend()
 ax2.grid(True, alpha=0.3)
 
-# Rolling means
+# Posterior distribution (bootstrap distribution)
 ax3 = axes[2]
-window = 60
-rolling_means = pd.Series(log_returns).rolling(window=window).mean().values[window-1:]
-rolling_dates = plot_dates[window-1:]
-ax3.plot(rolling_dates, rolling_means, color='orange', linewidth=1.5, label=f'{window}-day Rolling Mean')
-ax3.axhline(y=np.mean(log_returns), color='blue', linestyle='--', label='Overall Mean')
-ax3.axvline(x=cp_date, color='red', linestyle='--', label='Change Point')
-ax3.set_title('Rolling Mean of Log Returns')
-ax3.set_xlabel('Date')
-ax3.set_ylabel('Rolling Mean')
+ax3.hist(results['bootstrap_indices'], bins=50, color='purple', alpha=0.7, edgecolor='black', density=True)
+ax3.axvline(cp_idx, color='red', linestyle='--', label=f'Median: {cp_date.strftime("%Y-%m-%d")}')
+ax3.axvline(results['ci_lower'], color='green', linestyle='--', label=f'95% CI Lower')
+ax3.axvline(results['ci_upper'], color='green', linestyle='--', label=f'95% CI Upper')
+ax3.set_title('Bootstrap Distribution of Change Point (Bayesian-style Posterior)')
+ax3.set_xlabel('Change Point Index')
+ax3.set_ylabel('Density')
 ax3.legend()
 ax3.grid(True, alpha=0.3)
 
@@ -254,16 +301,11 @@ print(f"Change point analysis saved to {os.path.join(plots_dir, 'change_point_an
 fig, ax = plt.subplots(figsize=(15, 8))
 
 ax.plot(brent_data['Date'], brent_data['Price'], color='blue', linewidth=1, alpha=0.7, label='Brent Oil Price')
-
-# Mark change point
 ax.axvline(x=cp_date, color='red', linewidth=2, linestyle='--', 
            label=f'Change Point: {cp_date.strftime("%Y-%m-%d")}')
+ax.axvspan(ci_lower_date, ci_upper_date, alpha=0.2, color='red', label='95% CI')
 
-# Add confidence interval
-ax.axvspan(plot_dates[max(0, tau_median-100)], plot_dates[min(n_obs-1, tau_median+100)], 
-           alpha=0.2, color='red', label='Approximate Uncertainty Region')
-
-# Add event annotations
+# Event annotations
 for idx, row in events_df.iterrows():
     if row['Expected_Impact'] == 'High':
         ax.axvline(x=row['Date'], color='orange', alpha=0.2, linestyle=':', linewidth=0.5)
@@ -282,21 +324,27 @@ plt.show()
 print(f"Change point on price series saved to {os.path.join(plots_dir, 'change_point_on_prices.png')}")
 
 # 5c. Distribution comparison
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+fig, axes = plt.subplots(1, 2, figsize=(15, 6))
 
 # Before distribution
+ax1 = axes[0]
 ax1.hist(before_data, bins=50, color='blue', alpha=0.7, edgecolor='black', density=True)
-ax1.axvline(mu_before, color='red', linestyle='--', label=f'Mean: {mu_before:.4f}')
-ax1.set_title(f'Distribution of Log Returns (Before {cp_date.strftime("%Y-%m-%d")})')
+ax1.axvline(mu_before, color='red', linestyle='--', label=f'Mean: {mu_before:.6f}')
+ax1.axvline(ci_before[0], color='green', linestyle='--', alpha=0.5, label='95% CI')
+ax1.axvline(ci_before[1], color='green', linestyle='--', alpha=0.5)
+ax1.set_title(f'Distribution (Before {cp_date.strftime("%Y-%m-%d")})')
 ax1.set_xlabel('Log Return')
 ax1.set_ylabel('Density')
 ax1.legend()
 ax1.grid(True, alpha=0.3)
 
 # After distribution
+ax2 = axes[1]
 ax2.hist(after_data, bins=50, color='green', alpha=0.7, edgecolor='black', density=True)
-ax2.axvline(mu_after, color='red', linestyle='--', label=f'Mean: {mu_after:.4f}')
-ax2.set_title(f'Distribution of Log Returns (After {cp_date.strftime("%Y-%m-%d")})')
+ax2.axvline(mu_after, color='red', linestyle='--', label=f'Mean: {mu_after:.6f}')
+ax2.axvline(ci_after[0], color='green', linestyle='--', alpha=0.5, label='95% CI')
+ax2.axvline(ci_after[1], color='green', linestyle='--', alpha=0.5)
+ax2.set_title(f'Distribution (After {cp_date.strftime("%Y-%m-%d")})')
 ax2.set_xlabel('Log Return')
 ax2.set_ylabel('Density')
 ax2.legend()
@@ -307,6 +355,28 @@ plt.savefig(os.path.join(plots_dir, 'distribution_comparison.png'), dpi=300, bbo
 plt.show()
 print(f"Distribution comparison saved to {os.path.join(plots_dir, 'distribution_comparison.png')}")
 
+# 5d. Mean comparison with credible intervals
+fig, ax = plt.subplots(figsize=(10, 6))
+
+# Create bar plot with error bars
+means = [mu_before, mu_after]
+cis = [ci_before, ci_after]
+labels = ['Before', 'After']
+
+bars = ax.bar(labels, means, color=['blue', 'green'], alpha=0.7, edgecolor='black')
+ax.errorbar(labels, means, yerr=[[means[0]-cis[0][0], means[1]-cis[1][0]], 
+                                 [cis[0][1]-means[0], cis[1][1]-means[1]]],
+           fmt='none', color='black', capsize=5)
+
+ax.set_title('Mean Log Returns Before and After Change Point')
+ax.set_ylabel('Mean Log Return')
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(os.path.join(plots_dir, 'mean_comparison.png'), dpi=300, bbox_inches='tight')
+plt.show()
+print(f"Mean comparison saved to {os.path.join(plots_dir, 'mean_comparison.png')}")
+
 # ============================================
 # 6. ASSOCIATE CHANGE WITH EVENTS
 # ============================================
@@ -315,7 +385,7 @@ print("\n" + "=" * 80)
 print("6. ASSOCIATING CHANGE WITH EVENTS")
 print("=" * 80)
 
-# Find events close to the change point
+# Find events near change point
 events_near_cp = events_df[
     (events_df['Date'] >= cp_date - pd.Timedelta(days=90)) &
     (events_df['Date'] <= cp_date + pd.Timedelta(days=90))
@@ -323,22 +393,34 @@ events_near_cp = events_df[
 
 print(f"\nEvents near the change point ({cp_date.strftime('%Y-%m-%d')} +/- 90 days):")
 print("-" * 70)
+
 if len(events_near_cp) > 0:
     for idx, row in events_near_cp.iterrows():
         days_diff = (row['Date'] - cp_date).days
         print(f"  {row['Date'].strftime('%Y-%m-%d')} | {row['Event']:<30} | Days from CP: {days_diff:+4d}")
-else:
-    print("  No major events found near the change point")
-
-# Find closest event
-if len(events_near_cp) > 0:
+    
+    # Find closest event
     closest_event = events_near_cp.iloc[np.argmin(np.abs(events_near_cp['Date'] - cp_date))]
+    
     print(f"\nMost likely associated event:")
     print(f"  Event: {closest_event['Event']}")
     print(f"  Date: {closest_event['Date'].strftime('%Y-%m-%d')}")
     print(f"  Days from CP: {(closest_event['Date'] - cp_date).days}")
     print(f"  Category: {closest_event['Category']}")
     print(f"  Description: {closest_event['Description']}")
+    
+    # Quantified impact statement
+    print(f"\n" + "=" * 80)
+    print("QUANTIFIED IMPACT STATEMENT")
+    print("=" * 80)
+    print(f"\nFollowing the {closest_event['Event']} around {closest_event['Date'].strftime('%Y-%m-%d')},")
+    print(f"the model detects a significant change point with a mean log return shift from")
+    print(f"{mu_before:.6f} to {mu_after:.6f}, representing a {change_pct:.2f}% change.")
+    print(f"The probability of this change being positive is {prob_positive:.1f}%.")
+    print(f"In price terms, this corresponds to a {price_change_pct:.2f}% change over 30 days.")
+    print(f"95% Credible Interval for the change: [{ci_diff[0]:.6f}, {ci_diff[1]:.6f}]")
+else:
+    print("  No major events found near the change point")
 
 # ============================================
 # 7. SAVE RESULTS
@@ -349,15 +431,23 @@ print("7. SAVING RESULTS")
 print("=" * 80)
 
 # Create results summary
-results = {
+results_summary = {
     'change_point_date': cp_date,
-    'change_point_idx': tau_median,
+    'change_point_idx': cp_idx,
+    'ci_lower': ci_lower_date,
+    'ci_upper': ci_upper_date,
     'mean_before': mu_before,
     'mean_after': mu_after,
     'mean_change': change_in_mean,
     'mean_change_pct': change_pct,
-    'ci_lower': ci_lower,
-    'ci_upper': ci_upper,
+    'ci_before_lower': ci_before[0],
+    'ci_before_upper': ci_before[1],
+    'ci_after_lower': ci_after[0],
+    'ci_after_upper': ci_after[1],
+    'ci_diff_lower': ci_diff[0],
+    'ci_diff_upper': ci_diff[1],
+    'prob_positive': prob_positive,
+    'prob_negative': prob_negative,
     'price_before': price_before,
     'price_after': price_after,
     'price_change': price_change,
@@ -365,13 +455,17 @@ results = {
     'most_likely_event': closest_event['Event'] if len(events_near_cp) > 0 else 'Unknown',
     'event_date': closest_event['Date'] if len(events_near_cp) > 0 else None,
     'event_category': closest_event['Category'] if len(events_near_cp) > 0 else 'Unknown',
-    'is_significant': is_significant
+    'days_from_event': (closest_event['Date'] - cp_date).days if len(events_near_cp) > 0 else None
 }
 
-results_df = pd.DataFrame([results])
+results_df = pd.DataFrame([results_summary])
 results_path = os.path.join(project_dir, 'data', 'change_point_results.csv')
 results_df.to_csv(results_path, index=False)
 print(f"Results saved to {results_path}")
+
+# ============================================
+# 8. FINAL SUMMARY
+# ============================================
 
 print("\n" + "=" * 80)
 print("TASK 2 COMPLETE")
@@ -380,8 +474,21 @@ print("=" * 80)
 print("\nSummary of Change Point Analysis:")
 print("-" * 50)
 print(f"Change Point Date: {cp_date.strftime('%Y-%m-%d')}")
+print(f"95% CI: {ci_lower_date.strftime('%Y-%m-%d')} to {ci_upper_date.strftime('%Y-%m-%d')}")
 print(f"Mean Log Return Change: {change_in_mean:.6f} ({change_pct:.2f}%)")
-print(f"95% CI: [{ci_lower:.6f}, {ci_upper:.6f}]")
+print(f"95% CI for Change: [{ci_diff[0]:.6f}, {ci_diff[1]:.6f}]")
 print(f"Price Impact (30-day): ${price_change:.2f} ({price_change_pct:.2f}%)")
 print(f"Associated Event: {closest_event['Event'] if len(events_near_cp) > 0 else 'Unknown'}")
-print(f"Significant Change: {is_significant}")
+print(f"Probability of Positive Change: {prob_positive:.1f}%")
+print(f"Statistically Significant: {results['is_significant']}")
+
+print("\n" + "=" * 80)
+print("DELIVERABLES GENERATED:")
+print("=" * 80)
+print(f"1. EDA Plot: {os.path.join(plots_dir, 'eda_for_modeling.png')}")
+print(f"2. Change Point Analysis: {os.path.join(plots_dir, 'change_point_analysis.png')}")
+print(f"3. Price Series with Change Point: {os.path.join(plots_dir, 'change_point_on_prices.png')}")
+print(f"4. Distribution Comparison: {os.path.join(plots_dir, 'distribution_comparison.png')}")
+print(f"5. Mean Comparison: {os.path.join(plots_dir, 'mean_comparison.png')}")
+print(f"6. Results Summary: {results_path}")
+print("=" * 80)
